@@ -1,0 +1,363 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>Drachin Reels - Gesture & Face Detection</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body {
+      width: 100%; height: 100%; overflow: hidden;
+      background: #000; font-family: system-ui, -apple-system, sans-serif;
+    }
+
+    .container {
+      width: 100%; height: 100vh; height: 100dvh;
+      overflow-y: scroll;
+      scroll-snap-type: y mandatory;
+      scroll-behavior: smooth;
+    }
+    .container::-webkit-scrollbar { display: none; }
+
+    .page {
+      width: 100%; height: 100vh; height: 100dvh;
+      scroll-snap-align: start;
+      position: relative;
+      background: #000;
+    }
+
+    iframe {
+      width: 100%; height: 100%; border: none;
+      position: absolute; top: 0; left: 0;
+    }
+
+    .label {
+      position: absolute;
+      bottom: 30px;
+      left: 16px;
+      color: #fff;
+      font-weight: bold;
+      font-size: 18px;
+      text-shadow: 0 2px 8px #000;
+      pointer-events: none;
+      z-index: 2;
+    }
+
+    .gesture-indicator {
+      position: fixed;
+      top: 20px;
+      left: 50%;
+      transform: translateX(-50%);
+      color: #0f0;
+      font-size: 14px;
+      background: rgba(0,0,0,0.7);
+      padding: 6px 16px;
+      border-radius: 20px;
+      z-index: 20;
+      display: none;
+      pointer-events: none;
+    }
+
+    .pause-overlay {
+      position: fixed;
+      inset: 0;
+      background: rgba(0,0,0,0.85);
+      z-index: 15;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      flex-direction: column;
+      color: #fff;
+      font-size: 20px;
+      font-weight: bold;
+      pointer-events: none;
+      display: none;
+      gap: 12px;
+    }
+    .pause-overlay.show { display: flex; }
+    .pause-overlay .icon { font-size: 60px; }
+
+    .status-bar {
+      position: fixed;
+      top: 12px;
+      right: 14px;
+      z-index: 20;
+      display: flex;
+      gap: 8px;
+    }
+    .status-dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: #555;
+    }
+    .status-dot.active { background: #0f0; }
+    .status-dot.face-active { background: #0f0; }
+    .status-dot.face-lost { background: #f00; }
+  </style>
+</head>
+<body>
+
+  <div class="container" id="ctn"></div>
+  <div class="gesture-indicator" id="gestureIndicator"></div>
+  <div class="pause-overlay" id="pauseOverlay">
+    <div class="icon">👀</div>
+    <div>Wajah tidak terdeteksi</div>
+    <div style="font-size:14px;color:#aaa;">Video dijeda otomatis</div>
+  </div>
+  <div class="status-bar">
+    <div class="status-dot" id="gestureDot" title="Gesture"></div>
+    <div class="status-dot" id="faceDot" title="Face Detection"></div>
+  </div>
+
+  <!-- TensorFlow + Blazeface + MediaPipe Hands -->
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.10.0/dist/tf.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/blazeface@0.0.7/dist/blazeface.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/hands.js"></script>
+
+  <script>
+    // ==================== CONFIG ====================
+    const XOR_KEY = '25041995';
+    const EMBED_BASE = 'https://ok.ru/videoembed/';
+    const RAW_URL = 'https://raw.githubusercontent.com/clickprog25/drachin-db/main/database.json';
+
+    // ==================== GLOBAL STATE ====================
+    let data = [];
+    let activeIdx = -1;
+    let frames = {};
+    let facePaused = false;
+    let gestureEnabled = false;
+    let faceEnabled = false;
+    let container;
+
+    const gestureIndicator = document.getElementById('gestureIndicator');
+    const pauseOverlay = document.getElementById('pauseOverlay');
+    const gestureDot = document.getElementById('gestureDot');
+    const faceDot = document.getElementById('faceDot');
+
+    // ==================== XOR DECRYPT ====================
+    function xorDecrypt(b64, key) {
+      const bytes = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+      const keyBytes = new TextEncoder().encode(key);
+      const dec = [];
+      for (let i = 0; i < bytes.length; i++) dec.push(bytes[i] ^ keyBytes[i % keyBytes.length]);
+      return new TextDecoder().decode(new Uint8Array(dec));
+    }
+
+    function shuffle(arr) {
+      for (let i = arr.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [arr[i], arr[j]] = [arr[j], arr[i]];
+      }
+      return arr;
+    }
+
+    // ==================== PLAYER ====================
+    function play(i) {
+      if (facePaused) return;
+      if (activeIdx === i) return;
+      // Hapus iframe lama
+      if (activeIdx >= 0 && frames[activeIdx]) {
+        frames[activeIdx].remove();
+        delete frames[activeIdx];
+      }
+      // Buat iframe baru
+      const ifrm = document.createElement('iframe');
+      ifrm.src = EMBED_BASE + data[i].id + '?autoplay=1';
+      ifrm.allow = 'autoplay; fullscreen';
+      ifrm.allowFullscreen = true;
+      document.getElementById('p' + i).appendChild(ifrm);
+      frames[i] = ifrm;
+      activeIdx = i;
+    }
+
+    function pauseCurrent() {
+      if (activeIdx >= 0 && frames[activeIdx]) {
+        frames[activeIdx].src = '';
+      }
+    }
+
+    function resumeCurrent() {
+      if (activeIdx >= 0 && frames[activeIdx]) {
+        frames[activeIdx].src = EMBED_BASE + data[activeIdx].id + '?autoplay=1';
+      }
+    }
+
+    function nextSlide() {
+      if (activeIdx < data.length - 1) {
+        const next = activeIdx + 1;
+        document.getElementById('p' + next).scrollIntoView({ behavior: 'smooth' });
+        play(next);
+      }
+    }
+
+    function prevSlide() {
+      if (activeIdx > 0) {
+        const prev = activeIdx - 1;
+        document.getElementById('p' + prev).scrollIntoView({ behavior: 'smooth' });
+        play(prev);
+      }
+    }
+
+    // ==================== FACE DETECTION ====================
+    async function initFaceDetection() {
+      try {
+        const model = await blazeface.load();
+        const video = document.createElement('video');
+        video.setAttribute('playsinline', '');
+        const stream = await navigator.mediaDevices.getUserMedia({ 
+          video: { facingMode: 'user', width: 320, height: 240 } 
+        });
+        video.srcObject = stream;
+        await video.play();
+        faceEnabled = true;
+        faceDot.classList.add('face-active');
+
+        async function detect() {
+          if (!faceEnabled) return;
+          const predictions = await model.estimateFaces(video, false);
+          
+          if (predictions.length === 0) {
+            // Wajah hilang
+            if (!facePaused) {
+              facePaused = true;
+              pauseCurrent();
+              pauseOverlay.classList.add('show');
+              faceDot.classList.remove('face-active');
+              faceDot.classList.add('face-lost');
+            }
+          } else {
+            // Wajah terdeteksi
+            if (facePaused) {
+              facePaused = false;
+              resumeCurrent();
+              pauseOverlay.classList.remove('show');
+              faceDot.classList.remove('face-lost');
+              faceDot.classList.add('face-active');
+            }
+          }
+          requestAnimationFrame(detect);
+        }
+        detect();
+        console.log('✅ Face detection aktif');
+      } catch (e) {
+        console.log('⚠️ Face detection tidak didukung:', e.message);
+        faceDot.style.background = '#555';
+      }
+    }
+
+    // ==================== HAND GESTURE ====================
+    async function initGesture() {
+      try {
+        const hands = new Hands({
+          locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/${file}`
+        });
+        
+        hands.setOptions({
+          maxNumHands: 1,
+          runtime: 'mediapipe',
+          modelComplexity: 0
+        });
+
+        hands.onResults((results) => {
+          if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+            const lm = results.multiHandLandmarks[0];
+            const wrist = lm[0];
+            const middleTip = lm[12];
+            const dy = middleTip.y - wrist.y;
+            
+            if (Math.abs(dy) > 0.2) {
+              const direction = dy > 0 ? 'down' : 'up';
+              
+              // Tampilkan indikator
+              gestureIndicator.style.display = 'block';
+              gestureIndicator.textContent = direction === 'down' ? '👇 Next' : '👆 Prev';
+              gestureDot.classList.add('active');
+              
+              setTimeout(() => {
+                gestureIndicator.style.display = 'none';
+                gestureDot.classList.remove('active');
+              }, 800);
+
+              // Eksekusi
+              if (direction === 'down') nextSlide();
+              else prevSlide();
+            }
+          }
+        });
+
+        // Kamera untuk gesture
+        const camVideo = document.createElement('video');
+        camVideo.setAttribute('playsinline', '');
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: 'user', width: 640, height: 480 }
+        });
+        camVideo.srcObject = stream;
+        await camVideo.play();
+
+        const sendFrame = async () => {
+          if (!gestureEnabled) return;
+          await hands.send({ image: camVideo });
+          requestAnimationFrame(sendFrame);
+        };
+        
+        gestureEnabled = true;
+        gestureDot.classList.add('active');
+        sendFrame();
+        console.log('✅ Hand gesture aktif');
+      } catch (e) {
+        console.log('⚠️ Hand gesture tidak didukung:', e.message);
+        gestureDot.style.background = '#555';
+      }
+    }
+
+    // ==================== INIT ====================
+    async function init() {
+      // Load data
+      const res = await fetch(RAW_URL);
+      const json = await res.json();
+      data = json.data.map(item => ({
+        nama: xorDecrypt(item.NAMAE, XOR_KEY),
+        id: xorDecrypt(item.LINK, XOR_KEY)
+      }));
+      data = shuffle(data);
+
+      // Build UI
+      container = document.getElementById('ctn');
+      container.innerHTML = data.map((d, i) => `
+        <div class="page" id="p${i}">
+          <div class="label">${escapeHtml(d.nama)}</div>
+        </div>
+      `).join('');
+
+      // Observer scroll
+      const observer = new IntersectionObserver(entries => {
+        entries.forEach(entry => {
+          if (entry.isIntersecting && !facePaused) {
+            const idx = parseInt(entry.target.id.slice(1));
+            play(idx);
+          }
+        });
+      }, { threshold: 0.7 });
+
+      document.querySelectorAll('.page').forEach(p => observer.observe(p));
+
+      // Play first
+      play(0);
+
+      // Init features
+      initFaceDetection();
+      initGesture();
+    }
+
+    function escapeHtml(str) {
+      const div = document.createElement('div');
+      div.textContent = str;
+      return div.innerHTML;
+    }
+
+    // Start
+    init();
+  </script>
+</body>
+</html>
